@@ -1,10 +1,12 @@
-# app.py (fixed)
+# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
 import zipfile, os, json
 
 import plotly.graph_objects as go
+
+# Wavelet libs
 import pywt
 from ssqueezepy import cwt as ss_cwt, ssq_cwt
 from ssqueezepy import Wavelet as SSqWavelet
@@ -12,7 +14,9 @@ from pycwt import wavelet as pycwt_wavelet
 
 st.set_page_config(layout="wide", page_title="Wavelet Analysis Lab")
 
-# ---------------------- Segmentation ----------------------
+# =====================================================
+# 1) Segmentation (unchanged)
+# =====================================================
 def segment_beads(df, column, threshold):
     start_indices, end_indices = [], []
     signal = df[column].to_numpy()
@@ -29,13 +33,17 @@ def segment_beads(df, column, threshold):
             i += 1
     return list(zip(start_indices, end_indices))
 
-# ---------------------- Session ----------------------
+# =====================================================
+# 2) Session State
+# =====================================================
 if "segmented_data" not in st.session_state:
     st.session_state.segmented_data = None
 if "observations" not in st.session_state:
-    st.session_state.observations = []
+    st.session_state.observations = []  # list of dicts: csv, bead, signal, status, data(pd.Series)
 
-# ---------------------- Sidebar Step 1 ----------------------
+# =====================================================
+# 3) Sidebar: Step 1 (Upload & Segmentation)
+# =====================================================
 st.sidebar.header("Step 1: Upload & Segmentation")
 uploaded_zip = st.sidebar.file_uploader("Upload ZIP of CSV files", type="zip", key="zip_upload")
 
@@ -66,7 +74,9 @@ if uploaded_zip:
                 st.session_state.observations.clear()
                 st.success("✅ Bead segmentation complete and locked!")
 
-# ---------------------- Sidebar Step 2 ----------------------
+# =====================================================
+# 4) Sidebar: Step 2 (Add Data)
+# =====================================================
 if st.session_state.segmented_data:
     st.sidebar.header("Step 2: Add Data for Analysis")
     csv_keys = list(st.session_state.segmented_data.keys())
@@ -89,13 +99,22 @@ if st.session_state.segmented_data:
     if st.sidebar.button("🔄 Reset Analysis (keep segmentation)", key="reset_btn"):
         st.session_state.observations.clear()
 
-# ---------------------- Helpers ----------------------
-def _color(status): return "green" if status == "OK" else "red"
+# =====================================================
+# 5) Helpers
+# =====================================================
+def _color(status): 
+    return "green" if status == "OK" else "red"
 
 def normalize_mag(Z, mode, db_range=None):
+    """
+    Z: 2D nonnegative magnitude array (float)
+    mode: "Auto" | "% of Max" | "Fixed dB"
+    db_range: (min_db, max_db) when mode == "Fixed dB"
+    """
     eps = 1e-12
     Z = np.asarray(Z, dtype=float)
     Z = np.nan_to_num(Z, nan=0.0, posinf=0.0, neginf=0.0)
+
     if mode == "Auto":
         Zdb = 20.0 * np.log10(np.maximum(Z, eps))
         return Zdb, None, None
@@ -117,7 +136,8 @@ def safe_heatmap(fig, Z_disp, t, freqs, zmin=None, zmax=None, colorscale="Viridi
     freqs = np.nan_to_num(np.asarray(freqs, float), nan=0.0, posinf=0.0, neginf=0.0)
     fig.add_trace(go.Heatmap(
         z=Z_disp.tolist(), x=t.tolist(), y=freqs.tolist(),
-        zmin=zmin, zmax=zmax, colorscale=colorscale, colorbar=dict(title="Magnitude"),
+        zmin=zmin, zmax=zmax, colorscale=colorscale,
+        colorbar=dict(title="Magnitude"),
         name=name
     ))
 
@@ -125,6 +145,7 @@ def _cwt_freqs_from_scales(scales, fs):
     return pywt.scale2frequency('morl', np.asarray(scales, float)) * float(fs)
 
 def _auto_trim_by_bead(observations):
+    """Group obs by bead and trim signals within each bead to the shortest length."""
     out = {}
     for obs in observations:
         out.setdefault(obs["bead"], []).append(obs)
@@ -139,18 +160,75 @@ def _pairwise_trim(a: pd.Series, b: pd.Series):
     return a.iloc[:n].reset_index(drop=True), b.iloc[:n].reset_index(drop=True)
 
 def _compute_coi_curve(x, fs, morlet_omega0=6):
+    """
+    Returns (t, freq_coi) using pycwt's Morlet COI.
+    """
     dt = 1.0 / float(fs)
     mother = pycwt_wavelet.Morlet(morlet_omega0)
     x0 = np.asarray(x, float) - float(np.mean(x))
+    # pycwt.cwt returns W, scales, freqs, coi, ...
     W, scales, freqs, coi, *_ = pycwt_wavelet.cwt(x0, dt, mother)
-    t = np.arange(len(x0)) * dt
+    t = np.arange(len(x0), dtype=float) * dt
     fcoi = 1.0 / np.maximum(np.asarray(coi, float), 1e-12)
     fcoi = np.nan_to_num(fcoi, nan=0.0, posinf=0.0, neginf=0.0)
     return t, fcoi
 
-# ---------------------- Main ----------------------
+# ---------- MODWT fallback helpers ----------
+def _has_modwt():
+    return hasattr(pywt, "modwt") and hasattr(pywt, "modwt_mra")
+
+def _safe_swt_max_level(n):
+    if hasattr(pywt, "swt_max_level"):
+        try:
+            return pywt.swt_max_level(n)
+        except Exception:
+            pass
+    return int(np.floor(np.log2(max(2, n))))
+
+def modwt_mra_fallback(x: np.ndarray, wavelet: str, level: int):
+    """
+    Returns (components_list, backend_name)
+    components_list: list of 1D arrays (D1..DJ, A_J) like MODWT MRA
+    backend_name: 'MODWT' or 'SWT(fallback)'
+    """
+    x = np.asarray(x, dtype=float)
+
+    if _has_modwt():
+        coeffs = pywt.modwt(x, wavelet=wavelet, level=level)
+        mra = pywt.modwt_mra(coeffs)  # [D1..DJ, A_J]
+        comps = [np.asarray(c, float) for c in mra]
+        return comps, "MODWT"
+
+    # SWT fallback
+    L = min(level, _safe_swt_max_level(len(x)))
+    if L < 1:
+        return [x.copy()], "SWT(fallback)"
+
+    swt_coeffs = pywt.swt(x, wavelet=wavelet, level=L)  # [(cA1,cD1),...,(cAL,cDL)]
+    details = []
+    for j in range(L):
+        c_list = []
+        for k, (cA, cD) in enumerate(swt_coeffs):
+            if k == j:
+                c_list.append((np.zeros_like(cA), cD))
+            else:
+                c_list.append((np.zeros_like(cA), np.zeros_like(cD)))
+        dj = pywt.iswt(c_list, wavelet=wavelet)
+        details.append(np.asarray(dj, float))
+    # Approx
+    approx_list = []
+    for k, (cA, cD) in enumerate(swt_coeffs):
+        approx_list.append((cA, np.zeros_like(cD)))
+    Aj = pywt.iswt(approx_list, wavelet=wavelet)
+    approx = np.asarray(Aj, float)
+    return details + [approx], "SWT(fallback)"
+
+# =====================================================
+# 6) Main: Wavelet Analysis Tabs
+# =====================================================
 if st.session_state.observations:
     st.title("Wavelet Analysis")
+
     tabs = st.tabs([
         "CWT (Scalogram)",
         "Synchrosqueezed CWT",
@@ -160,102 +238,130 @@ if st.session_state.observations:
         "Wavelet Coherence"
     ])
 
-    # -------- CWT --------
+    # -------- Tab 1: CWT --------
     with tabs[0]:
         fs = st.number_input("Sampling Rate (Hz) — CWT", value=10000, min_value=1, key="fs_cwt")
         norm_mode = st.selectbox("Normalization — CWT", ["Auto", "% of Max", "Fixed dB"], key="norm_cwt")
         dbrange = st.slider("dB Range — CWT", -140, 0, (-100, -20), key="dbr_cwt") if norm_mode == "Fixed dB" else None
         show_coi = st.checkbox("Show COI (cone of influence)", value=True, key="coi_cwt")
+
         with st.expander("Advanced (CWT)", expanded=False):
-            vpo = st.slider("Voices/Octave", 16, 64, 32, step=8, key="vpo_cwt")
-            mu = st.slider("Morlet μ", 3, 12, 6, key="mu_cwt")
+            vpo_cwt = st.slider("Voices/Octave", 16, 64, 32, step=8, key="vpo_cwt")
+            mu_cwt = st.slider("Morlet μ", 3, 12, 6, key="mu_cwt")
 
         fig_cwt = go.Figure()
         by_bead = _auto_trim_by_bead(st.session_state.observations)
         for bead, items in by_bead.items():
             for idx, (obs, s) in enumerate(items):
-                x = s.to_numpy(float)
-                Wx, scales = ss_cwt(x, wavelet=SSqWavelet(('morlet', {'mu': mu})), nv=vpo)
+                x = s.to_numpy(dtype=float)
+                Wx, scales = ss_cwt(x, wavelet=SSqWavelet(('morlet', {'mu': mu_cwt})), nv=vpo_cwt)
                 freqs = _cwt_freqs_from_scales(scales, fs)
                 Z = np.abs(Wx).astype(float)
                 Z_disp, zmin, zmax = normalize_mag(Z, norm_mode, dbrange)
                 t = np.arange(len(x), dtype=float) / float(fs)
-                safe_heatmap(fig_cwt, Z_disp, t, freqs, zmin=zmin, zmax=zmax,
-                             colorscale="Viridis",
-                             name=f"{obs['csv']} · Bead {obs['bead']} ({obs['status']})")
+
+                safe_heatmap(
+                    fig_cwt, Z_disp, t, freqs, zmin=zmin, zmax=zmax,
+                    colorscale="Viridis",
+                    name=f"{obs['csv']} · Bead {obs['bead']} ({obs['status']})"
+                )
+
                 if show_coi:
                     try:
                         tcoi, fcoi = _compute_coi_curve(x, fs, morlet_omega0=6)
-                        fig_cwt.add_trace(go.Scatter(x=tcoi.tolist(), y=fcoi.tolist(),
-                                                     mode="lines",
-                                                     line=dict(color="white", width=2, dash="dash"),
-                                                     name=f"COI · {obs['csv']} · Bead {obs['bead']}"))
+                        fig_cwt.add_trace(go.Scatter(
+                            x=tcoi.tolist(), y=fcoi.tolist(),
+                            mode="lines",
+                            line=dict(color="white", width=2, dash="dash"),
+                            name=f"COI · {obs['csv']} · Bead {obs['bead']}"
+                        ))
                     except Exception:
                         pass
+
         st.plotly_chart(fig_cwt, use_container_width=True, key="plt_cwt")
 
-    # -------- SSQ-CWT --------
+    # -------- Tab 2: SSQ-CWT --------
     with tabs[1]:
         fs = st.number_input("Sampling Rate (Hz) — SSQ", value=10000, min_value=1, key="fs_ssq")
         norm_mode = st.selectbox("Normalization — SSQ", ["Auto", "% of Max", "Fixed dB"], key="norm_ssq")
         dbrange = st.slider("dB Range — SSQ", -140, 0, (-100, -20), key="dbr_ssq") if norm_mode == "Fixed dB" else None
         show_coi = st.checkbox("Show COI — SSQ", value=True, key="coi_ssq")
+
         with st.expander("Advanced (SSQ)", expanded=False):
-            vpo = st.slider("Voices/Octave — SSQ", 16, 64, 32, step=8, key="vpo_ssq")
-            mu = st.slider("Morlet μ — SSQ", 3, 12, 6, key="mu_ssq")
+            vpo_ssq = st.slider("Voices/Octave — SSQ", 16, 64, 32, step=8, key="vpo_ssq")
+            mu_ssq = st.slider("Morlet μ — SSQ", 3, 12, 6, key="mu_ssq")
             show_ridge = st.checkbox("Plot ridge frequency", value=False, key="ridge_ssq")
 
         fig_ssq = go.Figure()
         by_bead = _auto_trim_by_bead(st.session_state.observations)
         for bead, items in by_bead.items():
             for idx, (obs, s) in enumerate(items):
-                x = s.to_numpy(float)
-                Tx, ssq_freqs = ssq_cwt(x, fs=float(fs), wavelet=('morlet', {'mu': mu}), nv=vpo)[:2]
+                x = s.to_numpy(dtype=float)
+                ssq_out = ssq_cwt(x, fs=float(fs), wavelet=('morlet', {'mu': mu_ssq}), nv=vpo_ssq)
+                Tx = np.asarray(ssq_out[0])
+                ssq_freqs = np.asarray(ssq_out[1])
+
                 Z = np.abs(Tx).astype(float)
                 Z_disp, zmin, zmax = normalize_mag(Z, norm_mode, dbrange)
                 t = np.arange(len(x), dtype=float) / float(fs)
-                safe_heatmap(fig_ssq, Z_disp, t, ssq_freqs, zmin=zmin, zmax=zmax,
-                             colorscale="Viridis",
-                             name=f"{obs['csv']} · Bead {obs['bead']} ({obs['status']})")
+
+                safe_heatmap(
+                    fig_ssq, Z_disp, t, ssq_freqs, zmin=zmin, zmax=zmax,
+                    colorscale="Viridis",
+                    name=f"{obs['csv']} · Bead {obs['bead']} ({obs['status']})"
+                )
+
                 if show_ridge:
                     ridge_idx = np.argmax(Z, axis=0)
                     ridge_freq = ssq_freqs[ridge_idx]
-                    fig_ssq.add_trace(go.Scatter(x=t.tolist(), y=ridge_freq.tolist(),
-                                                 mode="lines", line=dict(color="white", width=2),
-                                                 name=f"Ridge · {obs['csv']} · Bead {obs['bead']}"))
+                    fig_ssq.add_trace(go.Scatter(
+                        x=t.tolist(), y=ridge_freq.tolist(),
+                        mode="lines", line=dict(color="white", width=2),
+                        name=f"Ridge · {obs['csv']} · Bead {obs['bead']}"
+                    ))
+
                 if show_coi:
                     try:
                         tcoi, fcoi = _compute_coi_curve(x, fs, morlet_omega0=6)
-                        fig_ssq.add_trace(go.Scatter(x=tcoi.tolist(), y=fcoi.tolist(),
-                                                     mode="lines",
-                                                     line=dict(color="white", width=2, dash="dash"),
-                                                     name=f"COI · {obs['csv']} · Bead {obs['bead']}"))
+                        fig_ssq.add_trace(go.Scatter(
+                            x=tcoi.tolist(), y=fcoi.tolist(),
+                            mode="lines",
+                            line=dict(color="white", width=2, dash="dash"),
+                            name=f"COI · {obs['csv']} · Bead {obs['bead']}"
+                        ))
                     except Exception:
                         pass
+
         st.plotly_chart(fig_ssq, use_container_width=True, key="plt_ssq")
 
-    # -------- DWT Denoise + MRA --------
+    # -------- Tab 3: DWT Denoise + MRA --------
     with tabs[2]:
         with st.expander("Advanced (DWT)", expanded=False):
-            wave = st.selectbox("Wavelet family", ["db4", "db6", "sym8", "coif3"], index=0, key="wave_dwt")
+            wave_dwt = st.selectbox("Wavelet family", ["db4", "db6", "sym8", "coif3"], index=0, key="wave_dwt")
             maxlev_cap = st.slider("Max levels cap", 1, 10, 6, key="levcap_dwt")
 
-        # Always render one chart per observation (unique keys)
         for i, obs in enumerate(st.session_state.observations):
-            x = obs["data"].to_numpy(float)
-            maxlev = min(maxlev_cap, pywt.dwt_max_level(len(x), pywt.Wavelet(wave).dec_len))
-            coeffs = pywt.wavedec(x, wavelet=wave, level=maxlev, mode="symmetric")
-            sigma = np.median(np.abs(coeffs[-1])) / 0.6745
-            uth = sigma * np.sqrt(2 * np.log(len(x)))
-            coeffs_th = [coeffs[0]] + [pywt.threshold(c, value=uth, mode="soft") for c in coeffs[1:]]
-            x_dn = pywt.waverec(coeffs_th, wavelet=wave, mode="symmetric")
+            x = obs["data"].to_numpy(dtype=float)
+            try:
+                maxlev = min(maxlev_cap, pywt.dwt_max_level(len(x), pywt.Wavelet(wave_dwt).dec_len))
+                maxlev = max(1, int(maxlev))
+            except Exception:
+                maxlev = 4  # safe default
 
+            coeffs = pywt.wavedec(x, wavelet=wave_dwt, level=maxlev, mode="symmetric")
+            # VisuShrink soft
+            sigma = np.median(np.abs(coeffs[-1])) / 0.6745
+            uth = sigma * np.sqrt(2 * np.log(max(1, len(x))))
+            coeffs_th = [coeffs[0]] + [pywt.threshold(c, value=uth, mode="soft") for c in coeffs[1:]]
+            x_dn = pywt.waverec(coeffs_th, wavelet=wave_dwt, mode="symmetric")
+
+            # MRA: reconstruct each detail level
             comps = []
             for j in range(1, len(coeffs)):
-                ckeep = [np.zeros_like(c) for c in coeffs]
-                ckeep[0] = np.zeros_like(coeffs[0])
-                ckeep[j] = coeffs[j]
-                comp = pywt.waverec(ckeep, wavelet=wave, mode="symmetric")
+                keep = [np.zeros_like(c) for c in coeffs]
+                keep[0] = np.zeros_like(coeffs[0])
+                keep[j] = coeffs[j]
+                comp = pywt.waverec(keep, wavelet=wave_dwt, mode="symmetric")
                 comps.append(np.asarray(comp, float))
 
             fig_dwt = go.Figure()
@@ -268,40 +374,61 @@ if st.session_state.observations:
                                   xaxis_title="Index", yaxis_title="Amplitude")
             st.plotly_chart(fig_dwt, use_container_width=True, key=f"plt_dwt_{i}")
 
-    # -------- MODWT + MRA --------
+    # -------- Tab 4: MODWT + MRA (with SWT fallback) --------
     with tabs[3]:
         with st.expander("Advanced (MODWT)", expanded=False):
-            wave = st.selectbox("Wavelet family (MODWT)", ["db4", "db6", "sym8", "coif3"], index=0, key="wave_modwt")
-            levels = st.slider("Levels (MODWT)", 1, 10, 6, key="lev_modwt")
+            wave_mod = st.selectbox("Wavelet family (MODWT)", ["db4", "db6", "sym8", "coif3"], index=0, key="wave_modwt")
+            levels_mod = st.slider("Levels (MODWT)", 1, 10, 6, key="lev_modwt")
 
+        backend_used = None
         for i, obs in enumerate(st.session_state.observations):
-            x = obs["data"].to_numpy(float)
-            coeffs = pywt.modwt(x, wavelet=wave, level=levels)
-            mra = pywt.modwt_mra(coeffs)
+            x = obs["data"].to_numpy(dtype=float)
+
+            try:
+                comps, backend_used = modwt_mra_fallback(x, wavelet=wave_mod, level=levels_mod)
+            except Exception as e:
+                st.error(f"Failed MODWT/SWT for {obs['csv']} · Bead {obs['bead']}: {e}")
+                continue
 
             fig_modwt = go.Figure()
-            for j, comp in enumerate(mra, 1):
-                comp = np.asarray(comp, float)
-                fig_modwt.add_trace(go.Scatter(y=comp.tolist(), mode="lines", name=f"L{j}"))
-            fig_modwt.update_layout(title=f"MODWT MRA — {obs['csv']} · Bead {obs['bead']} ({obs['status']})",
-                                    xaxis_title="Index", yaxis_title="Component")
+            for j, comp in enumerate(comps, 1):
+                fig_modwt.add_trace(go.Scatter(
+                    y=np.asarray(comp, float).tolist(),
+                    mode="lines",
+                    name=f"L{j}" if j < len(comps) else f"A{levels_mod}"
+                ))
+            title_suffix = backend_used or "MODWT"
+            fig_modwt.update_layout(
+                title=f"Multiresolution Components ({title_suffix}) — {obs['csv']} · Bead {obs['bead']} ({obs['status']})",
+                xaxis_title="Index", yaxis_title="Component"
+            )
             st.plotly_chart(fig_modwt, use_container_width=True, key=f"plt_modwt_{i}")
 
-    # -------- Wavelet Packets --------
+        if backend_used is not None:
+            st.caption(f"Backend used: **{backend_used}** "
+                       f"({'true MODWT via PyWavelets' if backend_used=='MODWT' else 'SWT-based fallback when MODWT is unavailable'})")
+
+    # -------- Tab 5: Wavelet Packets --------
     with tabs[4]:
         with st.expander("Advanced (Packets)", expanded=False):
-            wave = st.selectbox("Wavelet family (packets)", ["db4", "db6", "sym8", "coif3"], index=0, key="wave_pkt")
-            maxlevel = st.slider("Max level (packets)", 1, 8, 4, key="lev_pkt")
+            wave_pkt = st.selectbox("Wavelet family (packets)", ["db4", "db6", "sym8", "coif3"], index=0, key="wave_pkt")
+            maxlevel_pkt = st.slider("Max level (packets)", 1, 8, 4, key="lev_pkt")
             criterion = st.selectbox("Best-basis criterion", ["entropy", "shannon", "sure", "logenergy"], index=0, key="crit_pkt")
         crit = "entropy" if criterion in ["entropy", "shannon"] else criterion
 
         for i, obs in enumerate(st.session_state.observations):
-            x = obs["data"].to_numpy(float)
-            wp = pywt.WaveletPacket(data=x, wavelet=wave, mode='symmetric', maxlevel=maxlevel)
-            level_nodes = wp.get_best_level(decomp_level=maxlevel, criterion=crit)
-            if not level_nodes:
-                st.info(f"No packet nodes at level {maxlevel} for {obs['csv']} · Bead {obs['bead']}")
+            x = obs["data"].to_numpy(dtype=float)
+            try:
+                wp = pywt.WaveletPacket(data=x, wavelet=wave_pkt, mode='symmetric', maxlevel=maxlevel_pkt)
+                level_nodes = wp.get_best_level(decomp_level=maxlevel_pkt, criterion=crit)
+            except Exception as e:
+                st.error(f"Wavelet Packets failed for {obs['csv']} · Bead {obs['bead']}: {e}")
                 continue
+
+            if not level_nodes:
+                st.info(f"No packet nodes at level {maxlevel_pkt} for {obs['csv']} · Bead {obs['bead']}")
+                continue
+
             nodes = [n.path for n in level_nodes]
             energies = [float(np.sum(np.square(np.asarray(n.data, float)))) for n in level_nodes]
 
@@ -310,7 +437,7 @@ if st.session_state.observations:
                                   xaxis_title="Node", yaxis_title="Energy")
             st.plotly_chart(fig_pkt, use_container_width=True, key=f"plt_pkt_{i}")
 
-    # -------- Wavelet Coherence --------
+    # -------- Tab 6: Wavelet Coherence --------
     with tabs[5]:
         if len(st.session_state.observations) < 2:
             st.info("Add at least two signals to compare for coherence.")
@@ -331,6 +458,7 @@ if st.session_state.observations:
                 dt = 1.0 / float(fs)
                 mother = pycwt_wavelet.Morlet(6)
 
+                # WCT returns: W12, cross, coi, freq, signif, rsq, period, scale, wcoh, phase
                 W12, cross, coi, freq, signif, rsq, period, scale, wcoh, phase = \
                     pycwt_wavelet.wct(np.asarray(x, float), np.asarray(y, float), dt, mother)
 
@@ -343,13 +471,16 @@ if st.session_state.observations:
                 safe_heatmap(fig_coh, rsq, t, freq_hz, zmin=0.0, zmax=1.0, colorscale="Turbo",
                              name=f"A: {fmt(a)} · B: {fmt(b)}")
 
+                # COI overlay
                 try:
                     coi = np.asarray(coi, float)
                     fcoi = 1.0 / np.maximum(coi, 1e-12)
-                    fig_coh.add_trace(go.Scatter(x=t.tolist(), y=fcoi.tolist(),
-                                                 mode="lines",
-                                                 line=dict(color="white", width=2, dash="dash"),
-                                                 name="COI"))
+                    fig_coh.add_trace(go.Scatter(
+                        x=t.tolist(), y=fcoi.tolist(),
+                        mode="lines",
+                        line=dict(color="white", width=2, dash="dash"),
+                        name="COI"
+                    ))
                 except Exception:
                     pass
 
