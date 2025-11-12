@@ -136,23 +136,29 @@ if st.session_state.observations:
             dbrange = st.slider("dB Range", -120, 0, (-80,-20))
         else:
             dbrange = (-80,-20)
-
+    
         fig = go.Figure()
         for obs in st.session_state.observations:
             x = obs["data"].to_numpy()
-            W, scales, freqs, *_ = ss_cwt(x, fs=fs, wavelet=SSqWavelet(('morlet',{'mu':6})))
-            Z, zmin, zmax = normalize_mag(np.abs(W), norm_mode, dbrange)
+            # --- Stable CWT computation ---
+            Wx, scales = ss_cwt(x, wavelet=('morlet', {'mu':6}))
+            # derive frequencies manually
+            freqs = pywt.scale2frequency('morl', scales) * fs
+            Z, zmin, zmax = normalize_mag(np.abs(Wx), norm_mode, dbrange)
             t = np.arange(len(x))/fs
             fig.add_trace(go.Heatmap(
                 z=Z, x=t, y=freqs, colorscale="Viridis",
                 colorbar=dict(title="Magnitude"),
                 name=f"{obs['csv']} Bead {obs['bead']}"
             ))
+    
         fig.update_layout(
             title="Continuous Wavelet Transform (CWT Scalogram)",
-            xaxis_title="Time [s]", yaxis_title="Frequency [Hz]"
+            xaxis_title="Time [s]",
+            yaxis_title="Frequency [Hz]"
         )
         st.plotly_chart(fig, use_container_width=True)
+
 
     # -------------------------------------------------
     #  SSQ-CWT
