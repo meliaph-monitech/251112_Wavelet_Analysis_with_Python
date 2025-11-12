@@ -179,7 +179,7 @@ if st.session_state.observations:
                 freqs = _cwt_freqs_from_scales(scales, fs)
                 Z = np.abs(Wx).astype(float)
                 Z_disp, zmin, zmax = normalize_mag(Z, norm_mode, dbrange)
-                t = np.arange(len(x), float) / float(fs)
+                t = np.arange(len(x), dtype=float) / float(fs)
                 safe_heatmap(fig_cwt, Z_disp, t, freqs, zmin=zmin, zmax=zmax,
                              colorscale="Viridis",
                              name=f"{obs['csv']} · Bead {obs['bead']} ({obs['status']})")
@@ -213,7 +213,7 @@ if st.session_state.observations:
                 Tx, ssq_freqs = ssq_cwt(x, fs=float(fs), wavelet=('morlet', {'mu': mu}), nv=vpo)[:2]
                 Z = np.abs(Tx).astype(float)
                 Z_disp, zmin, zmax = normalize_mag(Z, norm_mode, dbrange)
-                t = np.arange(len(x), float) / float(fs)
+                t = np.arange(len(x), dtype=float) / float(fs)
                 safe_heatmap(fig_ssq, Z_disp, t, ssq_freqs, zmin=zmin, zmax=zmax,
                              colorscale="Viridis",
                              name=f"{obs['csv']} · Bead {obs['bead']} ({obs['status']})")
@@ -334,7 +334,7 @@ if st.session_state.observations:
                 W12, cross, coi, freq, signif, rsq, period, scale, wcoh, phase = \
                     pycwt_wavelet.wct(np.asarray(x, float), np.asarray(y, float), dt, mother)
 
-                t = np.arange(len(x), float) * dt
+                t = np.arange(len(x), dtype=float) * dt
                 rsq = np.asarray(rsq, float)
                 period = np.asarray(period, float)
                 freq_hz = 1.0 / np.maximum(period, 1e-12)
