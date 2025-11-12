@@ -132,22 +132,27 @@ if st.session_state.observations:
     with tabs[0]:
         fs = st.number_input("Sampling Rate (Hz)", value=10000)
         norm_mode = st.selectbox("Normalization", ["Auto","% of Max","Fixed dB"])
-        if norm_mode=="Fixed dB":
-            dbrange = st.slider("dB Range", -120, 0, (-80,-20))
+        if norm_mode == "Fixed dB":
+            dbrange = st.slider("dB Range", -120, 0, (-80, -20))
         else:
-            dbrange = (-80,-20)
+            dbrange = (-80, -20)
     
         fig = go.Figure()
         for obs in st.session_state.observations:
-            x = obs["data"].to_numpy()
-            # --- Stable CWT computation ---
-            Wx, scales = ss_cwt(x, wavelet=('morlet', {'mu':6}))
-            # derive frequencies manually
+            x = obs["data"].to_numpy(dtype=float)
+            Wx, scales = ss_cwt(x, wavelet=('morlet', {'mu': 6}))
             freqs = pywt.scale2frequency('morl', scales) * fs
-            Z, zmin, zmax = normalize_mag(np.abs(Wx), norm_mode, dbrange)
-            t = np.arange(len(x))/fs
+            Z = np.abs(Wx).astype(float)
+            Z = np.nan_to_num(Z, nan=0.0, posinf=0.0, neginf=0.0)
+            Z, zmin, zmax = normalize_mag(Z, norm_mode, dbrange)
+            t = np.arange(len(x)) / fs
+    
+            # Ensure JSON-serializable plain Python lists
             fig.add_trace(go.Heatmap(
-                z=Z, x=t, y=freqs, colorscale="Viridis",
+                z=Z.tolist(),
+                x=t.tolist(),
+                y=freqs.tolist(),
+                colorscale="Viridis",
                 colorbar=dict(title="Magnitude"),
                 name=f"{obs['csv']} Bead {obs['bead']}"
             ))
